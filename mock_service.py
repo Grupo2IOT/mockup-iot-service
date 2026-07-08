@@ -2,539 +2,469 @@
 """
 AquaEdge IoT Mock Service
 
-Simulates the full ESP32 → Edge-API → Supabase pipeline for local
-frontend / mobile development. Generates fake telemetry every 5 seconds,
-inserts it directly into your live Supabase project, and listens for
-commands from the Supabase `pending_commands` table.
+Simulates one AquaEdge IoT device and writes directly to Supabase PostgreSQL.
 
 Usage:
     python -m venv .venv
-    source .venv/bin/activate
+    .venv\\Scripts\\activate
     pip install -r requirements.txt
-    cp .env.example .env   # edit with your Supabase credentials
     python mock_service.py
-
-Interactive keys while running:
-    w   — send water_pump ON 10 s
-    f   — send fertilizer_pump ON 10 s
-    e   — toggle water level  SUFFICIENT ↔ EMPTY
-    s   — cycle sensor failure mode
-    d   — dump current state
-    q   — quit
 """
 
 from __future__ import annotations
 
-import json
 import os
 import random
-import sys
-import threading
 import time
-from datetime import datetime, timezone
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import psycopg2
 from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
+from psycopg2.sql import SQL, Identifier, Placeholder
 
-# ---------------------------------------------------------------------------
-# Load environment
-# ---------------------------------------------------------------------------
-load_dotenv()
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
-DEVICE_ID = os.environ.get("DEVICE_ID", "aquaedge-01")
-DEVICE_NAME = os.environ.get("DEVICE_NAME", "Development Mock")
-FIRMWARE_VERSION = os.environ.get("FIRMWARE_VERSION", "mock-1.0.0")
+load_dotenv(Path(__file__).with_name(".env"))
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DEVICE_CODE = os.environ.get("DEVICE_CODE", "aquaedge-01").strip()
 TICK_INTERVAL = int(os.environ.get("TICK_INTERVAL_SEC", "5"))
-
-# ---------------------------------------------------------------------------
-# Simulation state
-# ---------------------------------------------------------------------------
-
-class SimulationState:
-    """Holds all mutable state for one mock device."""
-
-    def __init__(self):
-        # Sensor values
-        self.soil_moisture = float(os.environ.get("SOIL_MOISTURE_START", "60.0"))
-        self.soil_fertility = float(os.environ.get("SOIL_FERTILITY_START", "3.5"))
-        self.soil_temperature = 22.0
-        self.air_temperature = 24.0
-        self.air_humidity = 60.0
-        self.water_level = os.environ.get("WATER_LEVEL", "SUFFICIENT")
-        self.wifi_rssi = -60
-
-        # Actuators
-        self.water_pump = "OFF"
-        self.fertilizer_pump = "OFF"
-
-        # Override timers (seconds remaining)
-        self.water_pump_timer = 0
-        self.fertilizer_pump_timer = 0
-
-        # Counters
-        self.tick_count = 0
-
-        # Failure simulation
-        self.failed_sensors: set[str] = set()
-        failure_env = os.environ.get("SENSOR_FAILURES", "").strip()
-        if failure_env:
-            self.failed_sensors = {s.strip() for s in failure_env.split(",") if s.strip()}
-
-    def is_sensor_valid(self, name: str) -> bool:
-        return name not in self.failed_sensors
-
-    def toggle_failure(self) -> str:
-        """Cycle through failure modes and return a human-readable description."""
-        modes = [
-            set(),
-            {"soil_moisture"},
-            {"soil_fertility"},
-            {"soil_temperature"},
-            {"air"},
-            {"water_level"},
-            {"soil_moisture", "soil_fertility"},
-        ]
-        try:
-            idx = modes.index(self.failed_sensors)
-        except ValueError:
-            idx = -1
-        self.failed_sensors = modes[(idx + 1) % len(modes)]
-        if self.failed_sensors:
-            return f"Failed sensors: {', '.join(sorted(self.failed_sensors))}"
-        return "All sensors healthy"
-
-    def toggle_water_level(self) -> str:
-        self.water_level = "EMPTY" if self.water_level == "SUFFICIENT" else "SUFFICIENT"
-        return f"Water level: {self.water_level}"
+VALID_WATER_LEVELS = {"EMPTY", "LOW", "MEDIUM", "FULL"}
+VALID_SYSTEM_HEALTH_VALUES = {"OK", "WARNING", "ERROR", "CRITICAL"}
+VALID_COMMAND_STATUSES = {"pending", "delivered", "executed", "rejected"}
 
 
-# ---------------------------------------------------------------------------
-# Supabase helpers
-# ---------------------------------------------------------------------------
-
-def _get_supabase():
-    """Lazy import so the script can start even if supabase is missing."""
+def normalize_uuid(value: Any, field_name: str) -> str:
     try:
-        from supabase import create_client
-    except ImportError as exc:
-        print("ERROR: supabase-py is not installed. Run: pip install -r requirements.txt")
-        raise SystemExit(1) from exc
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'{field_name} debe ser un UUID valido, recibido: {value!r}') from exc
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("ERROR: SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in .env")
+
+def normalize_water_level(value: str | None) -> str:
+    normalized = (value or "FULL").strip().upper()
+
+    if normalized not in VALID_WATER_LEVELS:
+        print(
+            f"[WARN] WATER_LEVEL={value!r} no es valido para el enum WaterLevel. "
+            "Usando FULL."
+        )
+        return "FULL"
+
+    return normalized
+
+
+def normalize_system_health(value: str | None) -> str:
+    normalized = (value or "OK").strip().upper()
+
+    if normalized not in VALID_SYSTEM_HEALTH_VALUES:
+        print(
+            f"[WARN] systemHealth={value!r} no es valido para el enum SystemHealth. "
+            "Usando OK."
+        )
+        return "OK"
+
+    return normalized
+
+
+@dataclass
+class SimulationState:
+    soil_moisture: float = float(os.environ.get("SOIL_MOISTURE_START", "60.0"))
+    soil_fertility: float = float(os.environ.get("SOIL_FERTILITY_START", "3.5"))
+    soil_temperature: float = 22.0
+    air_temperature: float = 24.0
+    air_humidity: float = 60.0
+    water_level: str = normalize_water_level(os.environ.get("WATER_LEVEL", "FULL"))
+    water_pump_state: str = "OFF"
+    fertilizer_pump_state: str = "OFF"
+    system_health: str = "OK"
+    water_pump_timer: int = 0
+    fertilizer_pump_timer: int = 0
+    tick_count: int = 0
+
+
+def connect():
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL no esta definido en .env")
         raise SystemExit(1)
 
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-
-def _insert_telemetry(supabase, payload: dict) -> None:
-    """Insert one telemetry row into Supabase."""
     try:
-        supabase.table("telemetry").insert(payload).execute()
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
     except Exception as exc:
-        print(f"[Supabase] telemetry insert error: {exc}")
+        print(f"ERROR: no se pudo conectar a PostgreSQL con DATABASE_URL: {exc}")
+        raise SystemExit(1) from exc
 
 
-def _fetch_pending_commands(supabase, device_id: str) -> list[dict]:
-    """Return pending commands for this device, ordered oldest first."""
-    try:
-        resp = (
-            supabase.table("pending_commands")
-            .select("*")
-            .eq("device_id", device_id)
-            .eq("status", "pending")
-            .order("created_at")
-            .execute()
+def get_table_columns(conn, table_name: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table_name,),
         )
-        return resp.data or []
-    except Exception as exc:
-        print(f"[Supabase] command fetch error: {exc}")
-        return []
+        return {row[0] for row in cur.fetchall()}
 
 
-def _update_command_status(supabase, cmd_id: str, status: str, reason: str | None = None) -> None:
-    """Update a command row to delivered / executed / rejected."""
+def get_required_tables_metadata(conn) -> dict[str, set[str]]:
+    metadata = {
+        "Device": get_table_columns(conn, "Device"),
+        "Telemetry": get_table_columns(conn, "Telemetry"),
+        "PendingCommand": get_table_columns(conn, "PendingCommand"),
+    }
+
+    missing = [name for name, columns in metadata.items() if not columns]
+    if missing:
+        print(f"ERROR: faltan tablas requeridas en PostgreSQL: {', '.join(missing)}")
+        raise SystemExit(1)
+
+    required_telemetry_columns = {"id", "deviceId"}
+    missing_telemetry_columns = required_telemetry_columns - metadata["Telemetry"]
+    if missing_telemetry_columns:
+        print(
+            'ERROR: faltan columnas requeridas en "Telemetry": '
+            f"{', '.join(sorted(missing_telemetry_columns))}"
+        )
+        raise SystemExit(1)
+
+    return metadata
+
+
+def get_device(conn) -> dict[str, Any]:
     try:
-        data: dict = {"status": status}
-        if status == "delivered":
-            data["delivered_at"] = datetime.now(timezone.utc).isoformat()
-        elif status in ("executed", "rejected"):
-            data["executed_at"] = datetime.now(timezone.utc).isoformat()
-            if reason:
-                data["result_reason"] = reason
-        supabase.table("pending_commands").update(data).eq("id", cmd_id).execute()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                'SELECT "id", "deviceCode" FROM "Device" WHERE "deviceCode" = %s LIMIT 1',
+                (DEVICE_CODE,),
+            )
+            device = cur.fetchone()
     except Exception as exc:
-        print(f"[Supabase] command update error: {exc}")
+        print(f'ERROR: no se pudo buscar el dispositivo en "Device": {exc}')
+        raise SystemExit(1) from exc
+
+    if not device:
+        print(
+            f'ERROR: no existe un dispositivo en "Device" con '
+            f'"deviceCode" = {DEVICE_CODE!r}. Crea el dispositivo desde el backend antes de iniciar el mock.'
+        )
+        raise SystemExit(1)
+
+    return dict(device)
 
 
-def _upsert_device(supabase, device_id: str) -> None:
-    """Ensure the devices table has a row for this mock device."""
-    try:
-        # Upsert is tricky in supabase-py; do an update-or-insert dance
-        resp = supabase.table("devices").select("id").eq("device_id", device_id).execute()
-        now = datetime.now(timezone.utc).isoformat()
-        if resp.data:
-            supabase.table("devices").update({"last_seen_at": now}).eq("device_id", device_id).execute()
+def update_device_online(conn, device_id: str, device_columns: set[str]) -> None:
+    values: dict[str, Any] = {}
+    if "status" in device_columns:
+        values["status"] = "ONLINE"
+    if "lastSeenAt" in device_columns:
+        values["lastSeenAt"] = SQL("NOW()")
+    if "updatedAt" in device_columns:
+        values["updatedAt"] = SQL("NOW()")
+
+    if not values:
+        return
+
+    assignments = []
+    params = []
+    for column, value in values.items():
+        if isinstance(value, SQL):
+            assignments.append(SQL("{} = {}").format(Identifier(column), value))
         else:
-            supabase.table("devices").insert({
-                "device_id": device_id,
-                "name": DEVICE_NAME,
-                "firmware_version": FIRMWARE_VERSION,
-                "last_seen_at": now,
-            }).execute()
-    except Exception as exc:
-        print(f"[Supabase] device upsert error: {exc}")
+            assignments.append(SQL("{} = {}").format(Identifier(column), Placeholder()))
+            params.append(value)
+
+    params.append(device_id)
+    query = SQL('UPDATE "Device" SET {} WHERE "id" = {}').format(
+        SQL(", ").join(assignments),
+        Placeholder(),
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(query, params)
 
 
-# ---------------------------------------------------------------------------
-# Simulation logic
-# ---------------------------------------------------------------------------
-
-def _build_telemetry_payload(state: SimulationState) -> dict:
-    """Convert the current simulation state into the exact JSON schema the edge-api expects."""
-    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-    # Autopilot diagnosis
-    needs_irrigation = state.soil_moisture < 30.0
-    needs_fertilization = state.soil_fertility < 2.5
-    alert = None
-    if state.water_level == "EMPTY":
-        alert = "Water tank is empty"
-    elif needs_irrigation and needs_fertilization:
-        alert = "Both irrigation and fertilization required"
-    elif needs_irrigation:
-        alert = "Irrigation required"
-    elif needs_fertilization:
-        alert = "Fertilization required"
-
-    # Health
-    failed = sorted(state.failed_sensors)
-    overall = "HEALTHY"
-    if failed:
-        overall = "DEGRADED" if len(failed) < 3 else "CRITICAL"
-
-    return {
-        "meta": {
-            "device_id": DEVICE_ID,
-            "firmware_version": FIRMWARE_VERSION,
-            "tick_count": state.tick_count,
-            "timestamp_utc": ts,
-            "wifi_rssi_dbm": round(state.wifi_rssi),
-        },
-        "sensors": {
-            "soil_moisture": {
-                "value": round(state.soil_moisture, 1) if state.is_sensor_valid("soil_moisture") else None,
-                "unit": "%",
-                "raw_adc": int((state.soil_moisture / 100.0) * 4095) if state.is_sensor_valid("soil_moisture") else 0,
-                "is_valid": state.is_sensor_valid("soil_moisture"),
-            },
-            "soil_fertility": {
-                "value": round(state.soil_fertility, 1) if state.is_sensor_valid("soil_fertility") else None,
-                "unit": "mS/cm",
-                "raw_adc": int((state.soil_fertility / 5.0) * 4095) if state.is_sensor_valid("soil_fertility") else 0,
-                "is_valid": state.is_sensor_valid("soil_fertility"),
-            },
-            "soil_temperature": {
-                "value": round(state.soil_temperature, 1) if state.is_sensor_valid("soil_temperature") else None,
-                "unit": "C",
-                "is_valid": state.is_sensor_valid("soil_temperature"),
-            },
-            "air": {
-                "temperature": round(state.air_temperature, 1) if state.is_sensor_valid("air") else None,
-                "humidity": round(state.air_humidity, 1) if state.is_sensor_valid("air") else None,
-                "is_valid": state.is_sensor_valid("air"),
-            },
-            "water_level": {
-                "status": state.water_level if state.is_sensor_valid("water_level") else "EMPTY",
-                "is_valid": state.is_sensor_valid("water_level"),
-            },
-        },
-        "diagnosis": {
-            "needs_irrigation": needs_irrigation,
-            "needs_fertilization": needs_fertilization,
-            "alert_message": alert,
-        },
-        "actuators": {
-            "water_pump": state.water_pump,
-            "fertilizer_pump": state.fertilizer_pump,
-        },
-        "system_health": {
-            "overall": overall,
-            "failed_sensors": failed,
-            "pending_commands": [],  # populated after command processing
-        },
-    }
-
-
-def _flatten_for_supabase(payload: dict) -> dict:
-    """Flatten the nested JSON payload into the flat telemetry table columns."""
-    meta = payload["meta"]
-    sensors = payload["sensors"]
-    diagnosis = payload["diagnosis"]
-    actuators = payload["actuators"]
-    health = payload["system_health"]
-
-    def b(val) -> bool | None:
-        return bool(val) if val is not None else None
-
-    return {
-        "device_id": meta["device_id"],
-        "tick_count": meta["tick_count"],
-        "timestamp_utc": meta["timestamp_utc"],
-        "wifi_rssi_dbm": meta["wifi_rssi_dbm"],
-        "firmware_version": meta["firmware_version"],
-
-        "soil_moisture_value": sensors["soil_moisture"].get("value"),
-        "soil_moisture_raw_adc": sensors["soil_moisture"].get("raw_adc"),
-        "soil_moisture_is_valid": b(sensors["soil_moisture"].get("is_valid")),
-
-        "soil_fertility_value": sensors["soil_fertility"].get("value"),
-        "soil_fertility_raw_adc": sensors["soil_fertility"].get("raw_adc"),
-        "soil_fertility_is_valid": b(sensors["soil_fertility"].get("is_valid")),
-
-        "soil_temperature_value": sensors["soil_temperature"].get("value"),
-        "soil_temperature_is_valid": b(sensors["soil_temperature"].get("is_valid")),
-
-        "air_temperature": sensors["air"].get("temperature"),
-        "air_humidity": sensors["air"].get("humidity"),
-        "air_is_valid": b(sensors["air"].get("is_valid")),
-
-        "water_level_status": sensors["water_level"].get("status"),
-        "water_level_is_valid": b(sensors["water_level"].get("is_valid")),
-
-        "needs_irrigation": b(diagnosis["needs_irrigation"]),
-        "needs_fertilization": b(diagnosis["needs_fertilization"]),
-        "alert_message": diagnosis["alert_message"],
-
-        "water_pump_state": actuators["water_pump"],
-        "fertilizer_pump_state": actuators["fertilizer_pump"],
-
-        "system_health_overall": health["overall"],
-        "failed_sensors": health["failed_sensors"],
-        "pending_commands": health["pending_commands"],
-    }
-
-
-def _update_sensors(state: SimulationState) -> None:
-    """Apply natural drift and pump effects to sensor state."""
-    # Natural drift
+def update_sensors(state: SimulationState) -> None:
     state.soil_moisture = max(0.0, min(100.0, state.soil_moisture - 0.3 + random.gauss(0, 0.1)))
-    state.soil_fertility = max(0.0, state.soil_fertility - 0.05 + random.gauss(0, 0.02))
+    state.soil_fertility = max(0.0, min(10.0, state.soil_fertility - 0.05 + random.gauss(0, 0.02)))
     state.soil_temperature = max(10.0, min(40.0, state.soil_temperature + random.gauss(0, 0.3)))
     state.air_temperature = max(15.0, min(35.0, state.air_temperature + random.gauss(0, 0.3)))
     state.air_humidity = max(20.0, min(95.0, state.air_humidity + random.gauss(0, 1.0)))
-    state.wifi_rssi = max(-90, min(-30, state.wifi_rssi + int(random.gauss(0, 2))))
 
-    # Pump effects
-    if state.water_pump == "ON":
+    if state.water_pump_state == "ON":
         state.soil_moisture = min(100.0, state.soil_moisture + 2.0)
-    if state.fertilizer_pump == "ON":
+    if state.fertilizer_pump_state == "ON":
         state.soil_fertility = min(10.0, state.soil_fertility + 0.5)
 
-
-def _process_commands(state: SimulationState, supabase, pending: list[dict]) -> list[dict]:
-    """Apply safety rules, execute commands, return command results for telemetry."""
-    results: list[dict] = []
-
-    for cmd in pending:
-        cmd_id = cmd["id"]
-        target = cmd["target"]
-        desired_state = cmd["state"]
-        duration = cmd.get("duration_sec", 10)
-
-        _update_command_status(supabase, cmd_id, "delivered")
-
-        # Tier 1 safety checks
-        if desired_state == "ON":
-            if state.water_level == "EMPTY":
-                results.append({
-                    "command": target,
-                    "executed": False,
-                    "reason": "SAFETY_VIOLATION: tank_empty",
-                })
-                _update_command_status(supabase, cmd_id, "rejected", "SAFETY_VIOLATION: tank_empty")
-                continue
-            if not state.is_sensor_valid("water_level"):
-                results.append({
-                    "command": target,
-                    "executed": False,
-                    "reason": "SAFETY_VIOLATION: water_sensor_invalid",
-                })
-                _update_command_status(supabase, cmd_id, "rejected", "SAFETY_VIOLATION: water_sensor_invalid")
-                continue
-
-        # Execute
-        if target == "water_pump":
-            state.water_pump = desired_state
-            state.water_pump_timer = duration if desired_state == "ON" else 0
-        elif target == "fertilizer_pump":
-            state.fertilizer_pump = desired_state
-            state.fertilizer_pump_timer = duration if desired_state == "ON" else 0
-
-        results.append({
-            "command": target,
-            "executed": True,
-            "reason": "override_active",
-        })
-        _update_command_status(supabase, cmd_id, "executed", "override_active")
-
-    return results
+    state.system_health = "WARNING" if state.water_level == "EMPTY" else "OK"
 
 
-def _expire_overrides(state: SimulationState) -> None:
-    """Decrement timers and turn pumps OFF when their override duration expires."""
+def expire_pumps(state: SimulationState) -> None:
     if state.water_pump_timer > 0:
-        state.water_pump_timer -= TICK_INTERVAL
-        if state.water_pump_timer <= 0:
-            state.water_pump = "OFF"
-            state.water_pump_timer = 0
+        state.water_pump_timer = max(0, state.water_pump_timer - TICK_INTERVAL)
+        if state.water_pump_timer == 0:
+            state.water_pump_state = "OFF"
+
     if state.fertilizer_pump_timer > 0:
-        state.fertilizer_pump_timer -= TICK_INTERVAL
-        if state.fertilizer_pump_timer <= 0:
-            state.fertilizer_pump = "OFF"
-            state.fertilizer_pump_timer = 0
+        state.fertilizer_pump_timer = max(0, state.fertilizer_pump_timer - TICK_INTERVAL)
+        if state.fertilizer_pump_timer == 0:
+            state.fertilizer_pump_state = "OFF"
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+def build_telemetry(state: SimulationState, device_id: str, telemetry_columns: set[str]) -> dict[str, Any]:
+    water_pump_on = state.water_pump_state == "ON"
+    fertilizer_pump_on = state.fertilizer_pump_state == "ON"
+    water_level = normalize_water_level(state.water_level)
+    system_health = normalize_system_health(state.system_health)
+    device_uuid = normalize_uuid(device_id, "deviceId")
+    state.water_level = water_level
+    state.system_health = system_health
 
-def run_mock():
+    payload = {
+        "id": str(uuid.uuid4()),
+        "deviceId": device_uuid,
+        "soilMoisture": round(state.soil_moisture, 2),
+        "soilFertility": round(state.soil_fertility, 2),
+        "soilTemperature": round(state.soil_temperature, 2),
+        "airTemperature": round(state.air_temperature, 2),
+        "airHumidity": round(state.air_humidity, 2),
+        "waterLevel": water_level,
+        "waterPumpState": state.water_pump_state,
+        "fertilizerPumpState": state.fertilizer_pump_state,
+        "systemHealth": system_health,
+        "tickCount": state.tick_count,
+        "createdAt": SQL("NOW()"),
+        "updatedAt": SQL("NOW()"),
+    }
+
+    aliases = {
+        "soil_moisture": round(state.soil_moisture, 2),
+        "soil_fertility": round(state.soil_fertility, 2),
+        "soil_temperature": round(state.soil_temperature, 2),
+        "air_temperature": round(state.air_temperature, 2),
+        "air_humidity": round(state.air_humidity, 2),
+        "water_level": water_level,
+        "waterPump": state.water_pump_state,
+        "fertilizerPump": state.fertilizer_pump_state,
+        "waterPumpOn": water_pump_on,
+        "fertilizerPumpOn": fertilizer_pump_on,
+        "pumpWater": water_pump_on,
+        "pumpFertilizer": fertilizer_pump_on,
+    }
+    payload.update({key: value for key, value in aliases.items() if key in telemetry_columns})
+
+    return {key: value for key, value in payload.items() if key in telemetry_columns}
+
+
+def insert_telemetry(conn, telemetry: dict[str, Any]) -> None:
+    if "id" not in telemetry:
+        raise RuntimeError('La tabla "Telemetry" no tiene la columna requerida "id".')
+    if "deviceId" not in telemetry:
+        raise RuntimeError('La tabla "Telemetry" no tiene la columna requerida "deviceId".')
+
+    columns = list(telemetry.keys())
+    values = []
+    placeholders = []
+
+    for column in columns:
+        value = telemetry[column]
+        if isinstance(value, SQL):
+            placeholders.append(value)
+        else:
+            placeholders.append(Placeholder())
+            values.append(value)
+
+    query = SQL('INSERT INTO "Telemetry" ({}) VALUES ({})').format(
+        SQL(", ").join(Identifier(column) for column in columns),
+        SQL(", ").join(placeholders),
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(query, values)
+
+
+def fetch_pending_commands(conn, device_id: str) -> list[dict[str, Any]]:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM "PendingCommand"
+            WHERE "deviceId" = %s AND "status" = %s
+            ORDER BY "createdAt" ASC
+            """,
+            (device_id, "pending"),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+
+def update_command(conn, command_id: str, status: str, command_columns: set[str]) -> None:
+    if status not in VALID_COMMAND_STATUSES:
+        raise ValueError(f"CommandStatus invalido: {status!r}")
+
+    updates: dict[str, Any] = {"status": status}
+    if status == "delivered" and "deliveredAt" in command_columns:
+        updates["deliveredAt"] = SQL("NOW()")
+    if status == "executed" and "executedAt" in command_columns:
+        updates["executedAt"] = SQL("NOW()")
+    if "updatedAt" in command_columns:
+        updates["updatedAt"] = SQL("NOW()")
+
+    assignments = []
+    params = []
+    for column, value in updates.items():
+        if isinstance(value, SQL):
+            assignments.append(SQL("{} = {}").format(Identifier(column), value))
+        else:
+            assignments.append(SQL("{} = {}").format(Identifier(column), Placeholder()))
+            params.append(value)
+
+    params.append(command_id)
+    query = SQL('UPDATE "PendingCommand" SET {} WHERE "id" = {}').format(
+        SQL(", ").join(assignments),
+        Placeholder(),
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+
+
+def normalize_command(command: dict[str, Any]) -> tuple[str | None, str | None, int]:
+    payload = command.get("payload") or {}
+    if isinstance(payload, str):
+        payload = {"raw": payload}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    target = (
+        command.get("target")
+        or command.get("command")
+        or command.get("type")
+        or payload.get("target")
+        or payload.get("command")
+        or payload.get("type")
+    )
+    desired_state = (
+        command.get("state")
+        or command.get("desiredState")
+        or payload.get("state")
+        or payload.get("desiredState")
+        or payload.get("value")
+    )
+    duration = command.get("durationSec") or payload.get("durationSec") or payload.get("duration") or 10
+
+    target_map = {
+        "water_pump": "water_pump",
+        "WATER_PUMP": "water_pump",
+        "IRRIGATION": "water_pump",
+        "fertilizer_pump": "fertilizer_pump",
+        "FERTILIZER_PUMP": "fertilizer_pump",
+        "FERTILIZATION": "fertilizer_pump",
+    }
+    state_map = {
+        True: "ON",
+        False: "OFF",
+        "on": "ON",
+        "off": "OFF",
+        "ON": "ON",
+        "OFF": "OFF",
+        "true": "ON",
+        "false": "OFF",
+    }
+
+    return target_map.get(target, target), state_map.get(desired_state, desired_state), int(duration)
+
+
+def apply_command(state: SimulationState, command: dict[str, Any]) -> None:
+    target, desired_state, duration = normalize_command(command)
+
+    if target not in {"water_pump", "fertilizer_pump"}:
+        print(f'[Command] Ignorado id={command.get("id")} target desconocido: {target!r}')
+        return
+    if desired_state not in {"ON", "OFF"}:
+        print(f'[Command] Ignorado id={command.get("id")} estado desconocido: {desired_state!r}')
+        return
+
+    if target == "water_pump":
+        state.water_pump_state = desired_state
+        state.water_pump_timer = duration if desired_state == "ON" else 0
+    else:
+        state.fertilizer_pump_state = desired_state
+        state.fertilizer_pump_timer = duration if desired_state == "ON" else 0
+
+    print(f'[Command] Ejecutado id={command.get("id")} {target}={desired_state} duration={duration}s')
+
+
+def process_commands(conn, state: SimulationState, device_id: str, command_columns: set[str]) -> int:
+    commands = fetch_pending_commands(conn, device_id)
+
+    for command in commands:
+        command_id = str(command["id"])
+        update_command(conn, command_id, "delivered", command_columns)
+        apply_command(state, command)
+        update_command(conn, command_id, "executed", command_columns)
+
+    return len(commands)
+
+
+def run_mock() -> None:
     print("=" * 60)
     print("AquaEdge IoT Mock Service")
-    print(f"Device: {DEVICE_ID}  |  Tick interval: {TICK_INTERVAL}s")
+    print(f"Device code: {DEVICE_CODE} | Tick interval: {TICK_INTERVAL}s")
     print("=" * 60)
 
-    supabase = _get_supabase()
+    conn = connect()
     state = SimulationState()
 
-    # Ensure device row exists
-    _upsert_device(supabase, DEVICE_ID)
-
-    print("\nConnected to Supabase. Starting simulation loop...")
-    print("Keys: w=water  f=fertilizer  e=empty-toggle  s=sensor-failure  d=dump  q=quit\n")
-
     try:
+        metadata = get_required_tables_metadata(conn)
+        device = get_device(conn)
+        device_id = str(device["id"])
+        conn.commit()
+
+        print(f'OK: dispositivo encontrado en "Device": deviceCode={DEVICE_CODE} id={device_id}')
+        print("OK: usando PostgreSQL directo con psycopg2. Iniciando simulacion...\n")
+
         while True:
-            state.tick_count += 1
+            try:
+                state.tick_count += 1
+                expire_pumps(state)
+                update_sensors(state)
 
-            # 1. Expire old overrides
-            _expire_overrides(state)
+                command_count = process_commands(conn, state, device_id, metadata["PendingCommand"])
+                telemetry = build_telemetry(state, device_id, metadata["Telemetry"])
+                insert_telemetry(conn, telemetry)
+                update_device_online(conn, device_id, metadata["Device"])
+                conn.commit()
 
-            # 2. Update sensors
-            _update_sensors(state)
-
-            # 3. Fetch pending commands from Supabase
-            pending = _fetch_pending_commands(supabase, DEVICE_ID)
-
-            # 4. Build payload
-            payload = _build_telemetry_payload(state)
-
-            # 5. Process commands (safety + execution)
-            if pending:
-                command_results = _process_commands(state, supabase, pending)
-                payload["system_health"]["pending_commands"] = command_results
-
-            # 6. Flatten and insert
-            flat = _flatten_for_supabase(payload)
-            _insert_telemetry(supabase, flat)
-            _upsert_device(supabase, DEVICE_ID)
-
-            # 7. Log
-            failed_info = f" failed={','.join(state.failed_sensors)}" if state.failed_sensors else ""
-            print(
-                f"[Tick {state.tick_count:>5}] "
-                f"M={state.soil_moisture:5.1f}% "
-                f"F={state.soil_fertility:4.1f} "
-                f"WP={state.water_pump:3s} "
-                f"FP={state.fertilizer_pump:3s} "
-                f"WL={state.water_level:10s} "
-                f"Cmds={len(pending)}"
-                f"{failed_info}"
-            )
+                print(
+                    f"[Tick {state.tick_count:>5}] "
+                    f"SM={state.soil_moisture:5.1f}% "
+                    f"SF={state.soil_fertility:4.1f} "
+                    f"ST={state.soil_temperature:4.1f}C "
+                    f"AT={state.air_temperature:4.1f}C "
+                    f"AH={state.air_humidity:4.1f}% "
+                    f"WL={state.water_level:10s} "
+                    f"WP={state.water_pump_state:3s} "
+                    f"FP={state.fertilizer_pump_state:3s} "
+                    f"Health={state.system_health:7s} "
+                    f"Cmds={command_count}"
+                )
+            except Exception as exc:
+                conn.rollback()
+                print(f"[ERROR] tick {state.tick_count}: {exc}")
 
             time.sleep(TICK_INTERVAL)
-
     except KeyboardInterrupt:
-        print("\n\nShutdown requested. Exiting.")
-
-
-# ---------------------------------------------------------------------------
-# Interactive key handler
-# ---------------------------------------------------------------------------
-
-def _interactive(state: SimulationState, supabase):
-    """Runs in a background thread reading single keystrokes."""
-    import tty
-    import termios
-    import select
-
-    old = termios.tcgetattr(sys.stdin)
-    try:
-        tty.setcbreak(sys.stdin)
-        while True:
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch = sys.stdin.read(1)
-                if ch == "q":
-                    print("\n[Interactive] Quit requested.")
-                    os._exit(0)
-                elif ch == "w":
-                    # Inject a water_pump ON command directly into Supabase
-                    try:
-                        supabase.table("pending_commands").insert({
-                            "device_id": DEVICE_ID,
-                            "target": "water_pump",
-                            "state": "ON",
-                            "duration_sec": 10,
-                            "status": "pending",
-                        }).execute()
-                        print("\n[Interactive] Queued: water_pump ON 10s")
-                    except Exception as exc:
-                        print(f"\n[Interactive] Error: {exc}")
-                elif ch == "f":
-                    try:
-                        supabase.table("pending_commands").insert({
-                            "device_id": DEVICE_ID,
-                            "target": "fertilizer_pump",
-                            "state": "ON",
-                            "duration_sec": 10,
-                            "status": "pending",
-                        }).execute()
-                        print("\n[Interactive] Queued: fertilizer_pump ON 10s")
-                    except Exception as exc:
-                        print(f"\n[Interactive] Error: {exc}")
-                elif ch == "e":
-                    msg = state.toggle_water_level()
-                    print(f"\n[Interactive] {msg}")
-                elif ch == "s":
-                    msg = state.toggle_failure()
-                    print(f"\n[Interactive] {msg}")
-                elif ch == "d":
-                    print(f"\n[Interactive] State dump: {json.dumps({
-                        'moisture': state.soil_moisture,
-                        'fertility': state.soil_fertility,
-                        'water_pump': state.water_pump,
-                        'fertilizer_pump': state.fertilizer_pump,
-                        'water_level': state.water_level,
-                        'failed_sensors': sorted(state.failed_sensors),
-                    }, indent=2)}")
+        print("\nShutdown requested. Exiting.")
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-
-
-def main():
-    supabase = _get_supabase()
-    state = SimulationState()
-
-    # Start interactive thread
-    t = threading.Thread(target=_interactive, args=(state, supabase), daemon=True)
-    t.start()
-
-    # Run main loop in main thread
-    run_mock()
+        conn.close()
 
 
 if __name__ == "__main__":
-    main()
+    run_mock()
